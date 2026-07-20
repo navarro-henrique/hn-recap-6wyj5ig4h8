@@ -1,0 +1,6 @@
+venv/
+.garmin_tokens/
+.email_config.json
+garmin/
+*.log
+__pycache__/
