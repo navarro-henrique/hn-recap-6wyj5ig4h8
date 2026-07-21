@@ -25,6 +25,47 @@ TOKENSTORE = os.path.join(PROJECT_DIR, ".garmin_tokens")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "garmin")
 DATA_JSON = os.path.join(OUTPUT_DIR, "data.json")
 
+STRENGTH_TYPES = {"strength_training", "hiit", "indoor_cardio"}
+
+# Garmin's auto-detected exercise category -> broad muscle group. Detection is
+# approximate (low-confidence categories are common), so this is a rough signal,
+# not a precise log.
+MUSCLE_GROUP_MAP = {
+    "BENCH_PRESS": "Chest", "FLYE": "Chest", "PUSH_UP": "Chest",
+    "CHEST_PRESS": "Chest",
+    "ROW": "Back", "PULL_UP": "Back", "LAT_PULLDOWN": "Back",
+    "BACK_EXTENSION": "Back", "SHRUG": "Back",
+    "SQUAT": "Legs", "LUNGE": "Legs", "LEG_PRESS": "Legs", "LEG_CURL": "Legs",
+    "LEG_RAISE": "Legs", "LEG_EXTENSION": "Legs", "CALF_RAISE": "Legs",
+    "DEADLIFT": "Legs", "HIP_RAISE": "Legs", "HIP_THRUST": "Legs",
+    "STEP_UP": "Legs", "HIP_STABILITY": "Legs", "HIP_SWING": "Legs",
+    "SHOULDER_PRESS": "Shoulders", "LATERAL_RAISE": "Shoulders",
+    "SHOULDER_STABILITY": "Shoulders",
+    "CURL": "Arms", "TRICEPS_EXTENSION": "Arms", "TRICEPS_DIP": "Arms",
+    "CORE": "Core", "SIT_UP": "Core", "CRUNCH": "Core", "PLANK": "Core",
+    "RUSSIAN_TWIST": "Core", "CHOP": "Core",
+    "CARDIO": "Cardio", "JUMP": "Cardio", "PLYO": "Cardio",
+    "MOUNTAIN_CLIMBER": "Cardio", "BURPEE": "Cardio", "CARRY": "Cardio",
+    "STAIR_STEPPER": "Cardio", "OLYMPIC_LIFT": "Full body",
+    "STRETCHING": "Mobility", "WARM_UP": "Mobility",
+}
+
+
+def categorize_exercise_sets(exercise_sets):
+    """Tally muscle groups from a get_activity_exercise_sets() response."""
+    tally = {}
+    for s in (exercise_sets or {}).get("exerciseSets", []):
+        if s.get("setType") != "ACTIVE":
+            continue
+        exercises = s.get("exercises") or []
+        best = max(exercises, key=lambda e: e.get("probability", 0), default=None)
+        if not best:
+            continue
+        category = best.get("category", "UNKNOWN")
+        group = MUSCLE_GROUP_MAP.get(category, "General / full-body")
+        tally[group] = tally.get(group, 0) + 1
+    return tally
+
 
 def connect():
     client = Garmin()
@@ -239,6 +280,18 @@ def main():
     )
     for activity in activities:
         notes_written.append(write_activity_note(activity))
+
+    raw_data.setdefault("exercise_sets", {})
+    for activity in activities:
+        activity_type = safe_get(activity, "activityType", "typeKey", default="")
+        activity_id = str(activity.get("activityId"))
+        if activity_type not in STRENGTH_TYPES or activity_id in raw_data["exercise_sets"]:
+            continue
+        try:
+            sets_data = client.get_activity_exercise_sets(activity.get("activityId"))
+            raw_data["exercise_sets"][activity_id] = categorize_exercise_sets(sets_data)
+        except Exception:
+            raw_data["exercise_sets"][activity_id] = {}
 
     day_cursor = start_day
     while day_cursor <= today:

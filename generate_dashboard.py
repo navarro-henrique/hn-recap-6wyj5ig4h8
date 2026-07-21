@@ -141,7 +141,13 @@ def merge_ftp_history(days, ftp_history):
             d["ftp"] = last
 
 
-def extract_activities(activities_raw):
+CYCLING_TYPES = {"road_biking", "cycling", "indoor_cycling", "virtual_ride", "mountain_biking", "gravel_cycling"}
+STRENGTH_TYPES = {"strength_training", "hiit", "indoor_cardio"}
+RUNNING_TYPES = {"running", "treadmill_running", "trail_running"}
+
+
+def extract_activities(activities_raw, exercise_sets_raw=None):
+    exercise_sets_raw = exercise_sets_raw or {}
     out = []
     for a in activities_raw:
         start = a.get("startTimeLocal", "")
@@ -151,20 +157,36 @@ def extract_activities(activities_raw):
         distance_km = m_to_km(a.get("distance"))
         duration_sec = a.get("duration")
         duration_min = round(duration_sec / 60, 1) if isinstance(duration_sec, (int, float)) else None
+        activity_type = safe_get(a, "activityType", "typeKey", default="activity")
         out.append({
             "id": a.get("activityId"),
             "date": day,
             "name": a.get("activityName") or "Workout",
-            "type": safe_get(a, "activityType", "typeKey", default="activity"),
+            "type": activity_type,
             "distance_km": distance_km,
             "duration_min": duration_min,
             "calories": a.get("calories"),
             "avg_hr": a.get("averageHR"),
             "max_hr": a.get("maxHR"),
+            "avg_power": a.get("avgPower"),
+            "normalized_power": a.get("normPower"),
             "aerobic_effect": a.get("aerobicTrainingEffect"),
+            "anaerobic_effect": a.get("anaerobicTrainingEffect"),
+            "muscle_groups": exercise_sets_raw.get(str(a.get("activityId"))) or {},
         })
     out.sort(key=lambda a: a["date"], reverse=True)
     return out
+
+
+def compute_muscle_balance(activities, days=14):
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    tally = {}
+    for a in activities:
+        if a["date"] < cutoff:
+            continue
+        for group, count in (a.get("muscle_groups") or {}).items():
+            tally[group] = tally.get(group, 0) + count
+    return dict(sorted(tally.items(), key=lambda kv: -kv[1]))
 
 
 def compute_weekly_volume(activities):
@@ -193,6 +215,93 @@ def compute_weekly_volume(activities):
 def _avg(values):
     vals = [v for v in values if isinstance(v, (int, float))]
     return round(statistics.mean(vals), 1) if vals else None
+
+
+ROUTINE = {
+    0: ("functional", "Functional training"),
+    1: ("cycling_flat", "Club ride — flat"),
+    2: ("functional", "Functional training"),
+    3: ("cycling_hilly", "Club ride — hilly"),
+    4: ("functional", "Functional training"),
+    5: ("cycling_long", "Club ride — long"),
+    6: ("rest", "Rest / free day"),
+}
+
+
+def compute_tomorrow_focus(daily, activities):
+    if not daily:
+        return {"headline": "Not enough data yet", "body": ["Check back after a few days of syncing."]}
+
+    latest = daily[-1]
+    tomorrow = date.today() + timedelta(days=1)
+    kind, label = ROUTINE[tomorrow.weekday()]
+
+    readiness_score = latest.get("readiness")
+    readiness_level = (latest.get("readiness_level") or "").upper()
+    hrv = latest.get("hrv")
+    sleep_score = latest.get("sleep_score")
+
+    if readiness_level == "HIGH" or (readiness_score is not None and readiness_score >= 70):
+        state = "high"
+    elif readiness_level in ("LOW", "POOR") or (readiness_score is not None and readiness_score < 40):
+        state = "low"
+    else:
+        state = "moderate"
+
+    stats_bits = []
+    if sleep_score is not None:
+        stats_bits.append(f"sleep score {sleep_score}")
+    if hrv is not None:
+        stats_bits.append(f"HRV {hrv} ms")
+    if readiness_score is not None:
+        lvl = f" ({readiness_level})" if readiness_level else ""
+        stats_bits.append(f"readiness {readiness_score}{lvl}")
+    stats_str = ", ".join(stats_bits) if stats_bits else "no recovery data yet for last night"
+
+    body = [f"Last night: {stats_str}."]
+
+    if kind == "cycling_flat":
+        if state == "high":
+            body.append("Recovery looks strong — good day for the harder peloton and sustained threshold power on the flats.")
+        elif state == "low":
+            body.append("Recovery is low tonight — take the easier peloton and treat tomorrow as aerobic/endurance riding, not a pace day.")
+        else:
+            body.append("Recovery is middling — ride with whichever peloton feels comfortable, but stop short of an all-out effort.")
+    elif kind == "cycling_hilly":
+        if state == "high":
+            body.append("Prime terrain for building FTP — consider the harder peloton and push seated/standing efforts on the climbs.")
+        elif state == "low":
+            body.append("Take the easier peloton and treat the hills as tempo work rather than max effort — let the legs recover.")
+        else:
+            body.append("Moderate recovery — pick your peloton by feel, and treat 1-2 climbs as quality efforts rather than the whole ride.")
+    elif kind == "cycling_long":
+        if state == "low":
+            body.append("Recovery is low going into the long ride — prioritize pacing and fueling early, don't chase the front group the whole way.")
+        else:
+            body.append("Good position for the long ride — steady aerobic pacing, and a good day to practice fueling/hydration for longer efforts.")
+    elif kind == "functional":
+        balance = compute_muscle_balance(activities, days=10)
+        if balance:
+            least = min(balance, key=balance.get)
+            body.append(f"Muscle balance over the last 10 days shows {least} getting the least attention — worth prioritizing it tomorrow if recovery allows.")
+        if state == "low":
+            body.append("Recovery is low — keep it lighter: mobility, core, and technique work over heavy loading.")
+        else:
+            body.append("Recovery supports a normal-intensity session.")
+    elif kind == "rest":
+        recent_km = sum(
+            a["distance_km"] or 0 for a in activities
+            if a["date"] >= (date.today() - timedelta(days=6)).isoformat()
+        )
+        if recent_km > 0:
+            body.append(
+                f"You've covered about {round(recent_km, 1)} km this week already — a full rest or an easy "
+                "spin both work, let how you feel guide it."
+            )
+        else:
+            body.append("Good chance to fully recover, or get outside for something light and low-stress.")
+
+    return {"headline": f"Tomorrow: {label}", "body": body}
 
 
 def compute_insights(daily, activities):
@@ -256,7 +365,7 @@ def compute_insights(daily, activities):
     return insights[:6]
 
 
-def compute_suggestions(daily, activities, weekly):
+def compute_suggestions(daily, activities, weekly, ftp_history=None):
     suggestions = []
     if len(daily) < 8:
         return suggestions
@@ -318,24 +427,60 @@ def compute_suggestions(daily, activities, weekly):
             "highest-stress days can help."
         )
 
+    def stagnant(vals, tolerance):
+        if len(vals) < 10:
+            return None
+        first_half = _avg(vals[:len(vals) // 2])
+        second_half = _avg(vals[len(vals) // 2:])
+        if first_half is None or second_half is None:
+            return None
+        return second_half <= first_half + tolerance
+
     window60 = daily[-60:] if len(daily) >= 60 else daily
-    vo2_vals = [d["vo2max_running"] for d in window60 if isinstance(d.get("vo2max_running"), (int, float))]
-    if len(vo2_vals) >= 10:
-        first_half = _avg(vo2_vals[:len(vo2_vals) // 2])
-        second_half = _avg(vo2_vals[len(vo2_vals) // 2:])
-        if first_half is not None and second_half is not None and second_half <= first_half + 0.3:
+
+    ftp_history = ftp_history or []
+    if len(ftp_history) >= 2:
+        latest_ftp, prior_ftp = ftp_history[-1]["ftp"], ftp_history[-2]["ftp"]
+        if latest_ftp <= prior_ftp:
             suggestions.append(
-                "Estimated running VO2 max has been flat over the recent stretch despite your training. "
-                "Mixing in structured intervals (e.g. 4x4min hard / 3min easy) is usually the most efficient "
-                "lever to push it further, more than adding easy volume."
+                f"Cycling FTP hasn't moved (currently {latest_ftp}W). Since Thursday's hilly ride is your best "
+                "structured-effort terrain, try 2-3 sustained 8-12min threshold efforts on the climbs — the "
+                "single biggest lever for raising FTP, more than extra easy volume."
             )
 
-    return suggestions[:5]
+    vo2_cycle_vals = [d["vo2max_cycling"] for d in window60 if isinstance(d.get("vo2max_cycling"), (int, float))]
+    if stagnant(vo2_cycle_vals, 0.3):
+        suggestions.append(
+            "Estimated cycling VO2 max has been flat despite consistent riding. Short, hard efforts — "
+            "4-5min at a very hard pace with equal recovery, worked into a club ride or on your own — tend to "
+            "move this more than additional steady-state volume."
+        )
+
+    balance = compute_muscle_balance(activities, days=14)
+    if balance and len(balance) >= 2:
+        max_group, max_count = max(balance.items(), key=lambda kv: kv[1])
+        min_group, min_count = min(balance.items(), key=lambda kv: kv[1])
+        if max_count >= 3 and min_count <= max_count * 0.3:
+            suggestions.append(
+                f"Over the last 14 days of functional training, {max_group.lower()} work has dominated and "
+                f"{min_group.lower()} has gotten comparatively little attention. Worth rebalancing your next "
+                "session or two toward it."
+            )
+
+    vo2_run_vals = [d["vo2max_running"] for d in window60 if isinstance(d.get("vo2max_running"), (int, float))]
+    if stagnant(vo2_run_vals, 0.3):
+        suggestions.append(
+            "Estimated running VO2 max has been flat over the recent stretch. Since running is a side interest "
+            "for you, this is only worth acting on if you want to — a few strides or a tempo effort now and "
+            "then would nudge it."
+        )
+
+    return suggestions[:6]
 
 
 # --------------------------------------------------------------------- HTML
 
-def render_html(daily, activities, weekly, insights, suggestions, generated_at):
+def render_html(daily, activities, weekly, insights, suggestions, tomorrow_focus, generated_at):
     data_blob = json.dumps({
         "daily": daily,
         "activities": activities[:60],
@@ -345,6 +490,39 @@ def render_html(daily, activities, weekly, insights, suggestions, generated_at):
     suggestions_html = "\n".join(f"<li>{s}</li>" for s in suggestions)
     latest = daily[-1] if daily else {}
 
+    focus_body_html = "\n".join(f"<p>{line}</p>" for line in tomorrow_focus["body"])
+
+    balance = compute_muscle_balance(activities, days=14)
+    if balance:
+        max_count = max(balance.values())
+        chips = []
+        for group, count in balance.items():
+            pct = round(count / max_count * 100)
+            chips.append(
+                f'<div class="chip"><span>{group}</span>'
+                f'<div class="chip-bar"><div class="chip-fill" style="width:{pct}%"></div></div>'
+                f'<span class="chip-count">{count}</span></div>'
+            )
+        balance_html = "\n".join(chips)
+    else:
+        balance_html = "<p class=\"cap\">No functional training sessions with detected exercises in the last 14 days.</p>"
+
+    functional_sessions = [a for a in activities if a.get("muscle_groups")][:8]
+    if functional_sessions:
+        rows = []
+        for a in functional_sessions:
+            groups_str = ", ".join(f"{g} ({c})" for g, c in sorted(a["muscle_groups"].items(), key=lambda kv: -kv[1]))
+            effect = a.get("aerobic_effect")
+            effect_str = f"{round(effect, 1)}" if isinstance(effect, (int, float)) else "—"
+            rows.append(
+                f"<tr><td>{a['date']}</td><td>{a['name']}</td>"
+                f"<td class=\"num\">{a['duration_min'] or '—'} min</td>"
+                f"<td class=\"num\">{effect_str}</td><td>{groups_str or 'Not detected'}</td></tr>"
+            )
+        functional_table_html = "\n".join(rows)
+    else:
+        functional_table_html = '<tr><td colspan="5" class="cap">No functional training sessions found yet.</td></tr>'
+
     html = HTML_TEMPLATE
     html = html.replace("__GENERATED_AT__", generated_at)
     html = html.replace("__INSIGHTS_LIST__", insights_html or "<li>No insights yet.</li>")
@@ -352,6 +530,10 @@ def render_html(daily, activities, weekly, insights, suggestions, generated_at):
         "__SUGGESTIONS_LIST__",
         suggestions_html or "<li>Nothing stands out right now — keep up the current routine.</li>",
     )
+    html = html.replace("__FOCUS_HEADLINE__", tomorrow_focus["headline"])
+    html = html.replace("__FOCUS_BODY__", focus_body_html)
+    html = html.replace("__MUSCLE_BALANCE__", balance_html)
+    html = html.replace("__FUNCTIONAL_TABLE__", functional_table_html)
     html = html.replace("__DATA_JSON__", data_blob)
     html = html.replace("__LATEST_DATE__", latest.get("date", "—"))
     return html
@@ -440,6 +622,27 @@ HTML_TEMPLATE = r"""<!doctype html>
     padding: 16px 18px;
   }
 
+  .focus-card {
+    background: var(--surface-1); border: 1px solid var(--border); border-left: 4px solid var(--series-1);
+    border-radius: 12px; padding: 18px 20px; margin-bottom: 20px;
+  }
+  .focus-card h2 { font-size: 12px; margin: 0 0 8px; color: var(--text-secondary); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .focus-card .headline { font-size: 20px; font-weight: 600; margin: 0 0 8px; }
+  .focus-card p { margin: 4px 0; font-size: 14px; line-height: 1.5; color: var(--text-primary); }
+
+  .section-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .04em; margin: 28px 0 10px; }
+  .section-title:first-of-type { margin-top: 0; }
+  .section-sub { font-size: 12px; color: var(--text-muted); margin: -6px 0 12px; }
+
+  .side-quest { opacity: 0.88; }
+  .side-quest .kpi-grid, .side-quest .chart-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+
+  .chip { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 13px; }
+  .chip span:first-child { min-width: 110px; color: var(--text-secondary); }
+  .chip-bar { flex: 1; height: 8px; background: var(--gridline); border-radius: 999px; overflow: hidden; }
+  .chip-fill { height: 100%; background: var(--series-1); border-radius: 999px; }
+  .chip-count { min-width: 20px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+
   .panel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; margin-bottom: 20px; }
   .insights.card { margin-bottom: 0; }
   .insights h2 { font-size: 14px; margin: 0 0 10px; color: var(--text-secondary); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
@@ -512,7 +715,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     <h1>Garmin Recovery &amp; Training</h1>
     <button class="theme-toggle" id="themeToggle" type="button">Toggle theme</button>
   </header>
-  <p class="subtitle">Latest day: __LATEST_DATE__ · Generated __GENERATED_AT__ · Read-only, local data only</p>
+  <p class="subtitle">Latest day: __LATEST_DATE__ · Generated __GENERATED_AT__ · Read-only, generated from Garmin data</p>
+
+  <section class="focus-card">
+    <h2>Focus</h2>
+    <p class="headline">__FOCUS_HEADLINE__</p>
+    __FOCUS_BODY__
+  </section>
 
   <div class="panel-grid">
     <section class="insights card">
@@ -525,7 +734,28 @@ HTML_TEMPLATE = r"""<!doctype html>
     </section>
   </div>
 
-  <div class="kpi-grid" id="kpiGrid"></div>
+  <p class="section-title">Recovery — right now</p>
+  <div class="kpi-grid" id="kpiGridRecovery"></div>
+
+  <p class="section-title">Cycling performance</p>
+  <p class="section-sub">Your main focus — VO2 max and FTP, so you can hold more power for longer.</p>
+  <div class="kpi-grid" id="kpiGridCycling"></div>
+
+  <p class="section-title">Functional training</p>
+  <p class="section-sub">Muscle groups worked over the last 14 days (Garmin's auto-detection is approximate).</p>
+  <section class="card" style="margin-bottom: 16px;">
+    __MUSCLE_BALANCE__
+  </section>
+  <section class="card activities-card" style="margin-bottom: 4px;">
+    <div class="activities-wrap" style="max-height: 260px;">
+      <table class="data-table">
+        <thead>
+          <tr><th>Date</th><th>Name</th><th class="num">Duration</th><th class="num">Training effect</th><th>Muscle groups (detected sets)</th></tr>
+        </thead>
+        <tbody>__FUNCTIONAL_TABLE__</tbody>
+      </table>
+    </div>
+  </section>
 
   <div class="filters" id="filters">
     <button data-days="7">7d</button>
@@ -535,15 +765,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     <button data-days="all">All</button>
   </div>
 
-  <div class="chart-grid" id="chartGrid"></div>
+  <p class="section-title">Recovery trends</p>
+  <div class="chart-grid" id="chartGridRecovery"></div>
 
+  <p class="section-title">Cycling trends</p>
+  <div class="chart-grid" id="chartGridCycling"></div>
+
+  <p class="section-title">Weekly training volume</p>
+  <div class="chart-grid" id="chartGridVolume"></div>
+
+  <section class="side-quest">
+    <p class="section-title">Running (side quest)</p>
+    <p class="section-sub">Occasional — not a priority, but nice to track progress.</p>
+    <div class="kpi-grid" id="kpiGridRunning"></div>
+    <div class="chart-grid" id="chartGridRunning"></div>
+  </section>
+
+  <p class="section-title">Recent workouts</p>
   <section class="card activities-card">
-    <div class="head-row">
-      <div>
-        <h3 style="margin:0 0 2px;">Recent workouts</h3>
-        <p class="cap" style="margin:0 0 10px;">Most recent activities (up to 60)</p>
-      </div>
-    </div>
     <div class="activities-wrap">
       <table class="data-table" id="activitiesTable">
         <thead>
@@ -554,7 +793,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     </div>
   </section>
 
-  <footer class="note">Built locally from garmin/data.json. Never sent anywhere; regenerate any time by re-running generate_dashboard.py.</footer>
+  <footer class="note">Built locally from garmin/data.json, updated automatically each evening, and published to an unlisted GitHub Pages URL not indexed by search engines. Never shared beyond that link.</footer>
 </div>
 </div>
 
@@ -601,16 +840,20 @@ function niceTicks(min, max, count) {
 }
 
 // ---------- KPI tiles ----------
-const KPI_DEFS = [
+const KPI_RECOVERY = [
   { key: 'sleep_score', label: 'Sleep score', unit: 'pts', higherGood: true, badge: null },
   { key: 'hrv', label: 'HRV', unit: 'ms', higherGood: true, badge: 'hrv_status' },
   { key: 'rhr', label: 'Resting HR', unit: 'bpm', higherGood: false, badge: null },
   { key: 'bb_high', label: 'Body battery (peak)', unit: '', higherGood: true, badge: null },
   { key: 'stress', label: 'Avg stress', unit: '', higherGood: false, badge: null },
   { key: 'readiness', label: 'Training readiness', unit: 'pts', higherGood: true, badge: 'readiness_level' },
-  { key: 'vo2max_running', label: 'VO2 max (running)', unit: '', higherGood: true, badge: null },
+];
+const KPI_CYCLING = [
   { key: 'vo2max_cycling', label: 'VO2 max (cycling)', unit: '', higherGood: true, badge: null },
-  { key: 'ftp', label: 'FTP (cycling)', unit: 'W', higherGood: true, badge: null },
+  { key: 'ftp', label: 'FTP', unit: 'W', higherGood: true, badge: null },
+];
+const KPI_RUNNING = [
+  { key: 'vo2max_running', label: 'VO2 max (running)', unit: '', higherGood: true, badge: null },
 ];
 
 function buildSparkline(values) {
@@ -637,15 +880,15 @@ function buildSparkline(values) {
   </svg>`;
 }
 
-function renderKPIs() {
-  const grid = document.getElementById('kpiGrid');
+function renderKPIGroup(defs, gridId) {
+  const grid = document.getElementById(gridId);
   grid.innerHTML = '';
   const daily = DATA.daily;
   const last7 = lastN(daily, 7);
   const prev7 = daily.slice(Math.max(0, daily.length - 14), Math.max(0, daily.length - 7));
   const latest = daily[daily.length - 1] || {};
 
-  KPI_DEFS.forEach(def => {
+  defs.forEach(def => {
     const curAvg = avg(last7.map(d => d[def.key]));
     const priorAvg = avg(prev7.map(d => d[def.key]));
     const latestVal = latest[def.key];
@@ -917,19 +1160,23 @@ function buildTable(points, cols) {
 }
 
 // ---------- chart cards ----------
-const CHART_DEFS = [
+const CHART_RECOVERY = [
   { id: 'hrv', title: 'HRV (overnight average)', key: 'hrv', unit: 'ms', type: 'line' },
   { id: 'rhr', title: 'Resting heart rate', key: 'rhr', unit: 'bpm', type: 'line' },
   { id: 'sleep', title: 'Sleep score', key: 'sleep_score', unit: 'pts', type: 'line' },
   { id: 'readiness', title: 'Training readiness', key: 'readiness', unit: 'pts', type: 'line' },
   { id: 'bodybattery', title: 'Body battery range', key: 'bb_high', key2: 'bb_low', unit: '', type: 'band' },
   { id: 'stress', title: 'Average daily stress', key: 'stress', unit: '', type: 'line' },
-  { id: 'vo2run', title: 'VO2 max (running, estimated)', key: 'vo2max_running', unit: '', type: 'line',
-    note: "Garmin only recalculates this after qualifying runs; value is carried forward between updates." },
+];
+const CHART_CYCLING = [
   { id: 'vo2cycle', title: 'VO2 max (cycling, estimated)', key: 'vo2max_cycling', unit: '', type: 'line',
     note: "Garmin only recalculates this after qualifying rides; value is carried forward between updates." },
   { id: 'ftp', title: 'Cycling FTP (Garmin estimate)', key: 'ftp', unit: 'W', type: 'line',
     note: "Garmin's API only exposes the current FTP reading, not history — this trend builds from the day syncing started, forward-filled between recalculations." },
+];
+const CHART_RUNNING = [
+  { id: 'vo2run', title: 'VO2 max (running, estimated)', key: 'vo2max_running', unit: '', type: 'line',
+    note: "Garmin only recalculates this after qualifying runs; value is carried forward between updates." },
 ];
 
 let currentDays = 365;
@@ -951,12 +1198,12 @@ function filteredActivities() {
   return DATA.activities.filter(a => a.date >= cutoffStr);
 }
 
-function renderCharts() {
-  const grid = document.getElementById('chartGrid');
+function renderChartGroup(defs, gridId) {
+  const grid = document.getElementById(gridId);
   grid.innerHTML = '';
   const daily = filteredDaily();
 
-  CHART_DEFS.forEach(def => {
+  defs.forEach(def => {
     const card = document.createElement('div');
     card.className = 'card chart-card';
     const head = document.createElement('div');
@@ -999,8 +1246,11 @@ function renderCharts() {
     card.appendChild(tableView);
     grid.appendChild(card);
   });
+}
 
-  // weekly volume as its own card
+function renderVolumeChart() {
+  const grid = document.getElementById('chartGridVolume');
+  grid.innerHTML = '';
   const weekly = filteredWeekly();
   const card = document.createElement('div');
   card.className = 'card chart-card';
@@ -1008,7 +1258,7 @@ function renderCharts() {
   head.className = 'head-row';
   const titleWrap = document.createElement('div');
   const h3 = document.createElement('h3'); textContentSet(h3, 'Weekly training volume'); titleWrap.appendChild(h3);
-  const cap = document.createElement('p'); cap.className = 'cap'; textContentSet(cap, 'Distance per week (km), Monday start'); titleWrap.appendChild(cap);
+  const cap = document.createElement('p'); cap.className = 'cap'; textContentSet(cap, 'Distance per week (km), Monday start, all activity types'); titleWrap.appendChild(cap);
   head.appendChild(titleWrap);
   const toggleBtn = document.createElement('button'); toggleBtn.className = 'table-toggle'; textContentSet(toggleBtn, 'View as table');
   head.appendChild(toggleBtn);
@@ -1049,9 +1299,18 @@ function renderActivitiesTable() {
   });
 }
 
+function renderAllCharts() {
+  renderChartGroup(CHART_RECOVERY, 'chartGridRecovery');
+  renderChartGroup(CHART_CYCLING, 'chartGridCycling');
+  renderChartGroup(CHART_RUNNING, 'chartGridRunning');
+  renderVolumeChart();
+}
+
 function renderAll() {
-  renderKPIs();
-  renderCharts();
+  renderKPIGroup(KPI_RECOVERY, 'kpiGridRecovery');
+  renderKPIGroup(KPI_CYCLING, 'kpiGridCycling');
+  renderKPIGroup(KPI_RUNNING, 'kpiGridRunning');
+  renderAllCharts();
   renderActivitiesTable();
 }
 
@@ -1061,7 +1320,7 @@ document.querySelectorAll('#filters button').forEach(btn => {
     btn.classList.add('active');
     const d = btn.getAttribute('data-days');
     currentDays = d === 'all' ? 'all' : parseInt(d, 10);
-    renderCharts();
+    renderAllCharts();
     renderActivitiesTable();
   });
 });
@@ -1081,15 +1340,17 @@ def main():
     with open(DATA_JSON, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    ftp_history = raw.get("cycling_ftp_history", [])
     daily = extract_daily(raw.get("wellness", {}))
-    merge_ftp_history(daily, raw.get("cycling_ftp_history", []))
-    activities = extract_activities(raw.get("activities", []))
+    merge_ftp_history(daily, ftp_history)
+    activities = extract_activities(raw.get("activities", []), raw.get("exercise_sets", {}))
     weekly = compute_weekly_volume(activities)
     insights = compute_insights(daily, activities)
-    suggestions = compute_suggestions(daily, activities, weekly)
+    suggestions = compute_suggestions(daily, activities, weekly, ftp_history)
+    tomorrow_focus = compute_tomorrow_focus(daily, activities)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    html = render_html(daily, activities, weekly, insights, suggestions, generated_at)
+    html = render_html(daily, activities, weekly, insights, suggestions, tomorrow_focus, generated_at)
     with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
