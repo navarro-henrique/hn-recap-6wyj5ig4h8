@@ -4,3 +4,4 @@ venv/
 garmin/
 *.log
 __pycache__/
+dashboard.html
