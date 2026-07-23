@@ -92,8 +92,12 @@ def extract_daily(wellness_by_day):
             readiness_level = readiness.get("level")
 
         max_metrics = d.get("max_metrics") or []
-        vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxValue")
-        vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxValue")
+        vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxPreciseValue")
+        if vo2max_running is None:
+            vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxValue")
+        vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxPreciseValue")
+        if vo2max_cycling is None:
+            vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxValue")
 
         days.append({
             "date": day_str,
@@ -217,6 +221,45 @@ def _avg(values):
     return round(statistics.mean(vals), 1) if vals else None
 
 
+def _rolling_7d_avgs(daily, key):
+    """7-day trailing average of `key`, ending at each day with >=7 days of history."""
+    out = []
+    for i in range(6, len(daily)):
+        avg = _avg([d[key] for d in daily[i - 6:i + 1]])
+        if avg is not None:
+            out.append((daily[i]["date"], avg))
+    return out
+
+
+def _milestone_text(daily, key, label, unit, higher_is_good, fmt="{:.1f}", window_days=60):
+    """If the current 7-day average is a new high/low vs the trailing window, describe it."""
+    window = daily[-window_days:] if len(daily) >= window_days else daily
+    rolling = _rolling_7d_avgs(window, key)
+    if len(rolling) < 8:
+        return None
+    current = rolling[-1][1]
+    history = [v for _, v in rolling[:-1]]
+    span_days = len(rolling)
+    if higher_is_good and current >= max(history):
+        return f"{label}'s 7-day average ({fmt.format(current)} {unit}) is the best it's been in the last {span_days} days."
+    if not higher_is_good and current <= min(history):
+        return f"{label}'s 7-day average ({fmt.format(current)} {unit}) is the best it's been in the last {span_days} days."
+    return None
+
+
+def _readiness_streak(daily):
+    """Consecutive days (most recent first) with HIGH training readiness."""
+    streak = 0
+    for d in reversed(daily):
+        level = (d.get("readiness_level") or "").upper()
+        score = d.get("readiness")
+        is_high = level == "HIGH" or (score is not None and score >= 70)
+        if not is_high:
+            break
+        streak += 1
+    return streak
+
+
 ROUTINE = {
     0: ("functional", "Functional training"),
     1: ("cycling_flat", "Club ride — flat"),
@@ -322,6 +365,9 @@ def compute_insights(daily, activities):
         delta = cur - prior
         pct = abs(delta) / abs(prior) * 100 if prior else 0
         if pct < 4:
+            milestone = _milestone_text(daily, key, label, unit, higher_is_good, fmt)
+            if milestone:
+                return milestone
             return f"{label} is steady: {fmt.format(cur)} {unit} (7-day avg), about the same as the week before."
         direction = "up" if delta > 0 else "down"
         good = (delta > 0) == higher_is_good
@@ -340,6 +386,13 @@ def compute_insights(daily, activities):
     ]:
         if line:
             insights.append(line)
+
+    streak = _readiness_streak(daily)
+    if streak >= 3:
+        insights.append(
+            f"Training readiness has been HIGH for {streak} days straight — your body is absorbing the "
+            "current load well and adapting."
+        )
 
     hrv_cur, hrv_prior = _avg([d["hrv"] for d in last7]), _avg([d["hrv"] for d in prev7]) if prev7 else None
     rhr_cur, rhr_prior = _avg([d["rhr"] for d in last7]), _avg([d["rhr"] for d in prev7]) if prev7 else None
@@ -362,7 +415,7 @@ def compute_insights(daily, activities):
             f"vs {len(prior_acts)} workout(s) / {prior_km} km the week before."
         )
 
-    return insights[:6]
+    return insights[:7]
 
 
 def compute_suggestions(daily, activities, weekly, ftp_history=None):
@@ -474,6 +527,40 @@ def compute_suggestions(daily, activities, weekly, ftp_history=None):
             "for you, this is only worth acting on if you want to — a few strides or a tempo effort now and "
             "then would nudge it."
         )
+
+    if not suggestions:
+        latest = daily[-1]
+        readiness_score = latest.get("readiness")
+        readiness_level = (latest.get("readiness_level") or "").upper()
+        hrv_latest = latest.get("hrv")
+        good_recovery = readiness_level == "HIGH" or (readiness_score is not None and readiness_score >= 70)
+        today_has_workout = any(a["date"] == today_d.isoformat() for a in activities)
+
+        stats_bits = []
+        if readiness_score is not None:
+            lvl = f" ({readiness_level})" if readiness_level else ""
+            stats_bits.append(f"readiness {readiness_score}{lvl}")
+        if hrv_latest is not None:
+            stats_bits.append(f"HRV {hrv_latest} ms")
+        stats_str = ", ".join(stats_bits) if stats_bits else "recovery looking strong"
+
+        if good_recovery and not today_has_workout:
+            suggestions.append(
+                f"No red flags this week, and today's numbers ({stats_str}) are strong with nothing logged "
+                "yet — good window to bring a harder session forward, or bank the rest guilt-free if that's "
+                "what you needed."
+            )
+        elif good_recovery:
+            suggestions.append(
+                "No red flags this week — recovery, sleep, and training load all look balanced. Good "
+                "position to hold your current intensity or add one quality session if you're chasing a "
+                "specific adaptation."
+            )
+        else:
+            suggestions.append(
+                "No red flags this week — everything's tracking within normal range. Nothing to change, "
+                "just keep stacking consistent sessions."
+            )
 
     return suggestions[:6]
 

@@ -229,8 +229,12 @@ def write_wellness_note(day, sleep, hrv, rhr, body_battery, stress, steps, readi
         else:
             lines.append(f"- Training readiness: {readiness_score}")
 
-    vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxValue")
-    vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxValue")
+    vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxPreciseValue")
+    if vo2max_running is None:
+        vo2max_running = safe_get(max_metrics, 0, "generic", "vo2MaxValue")
+    vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxPreciseValue")
+    if vo2max_cycling is None:
+        vo2max_cycling = safe_get(max_metrics, 0, "cycling", "vo2MaxValue")
     if vo2max_running:
         lines.append(f"- VO2 max (running): {vo2max_running}")
     if vo2max_cycling:
